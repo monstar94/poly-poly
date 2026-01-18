@@ -2,3 +2,4 @@ streamlit
 py-clob-client
 requests
 pandas
+pytz
