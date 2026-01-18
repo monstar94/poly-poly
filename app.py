@@ -3,131 +3,113 @@ import requests
 import json
 import pandas as pd
 import time
-import pytz
+import threading
 import random
+import pytz
 from datetime import datetime
+from websocket import create_connection
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
-st.set_page_config(page_title="ETH Live Terminal", layout="wide")
+st.set_page_config(page_title="AGGRESSIVE SNIPER V2", layout="wide")
 
-# --- ЛОГИКА АВТО-ССЫЛКИ ---
-def get_auto_slug():
-    tz_et = pytz.timezone('US/Eastern')
-    now = datetime.now(tz_et)
-    month = now.strftime("%B").lower()
-    day = now.strftime("%d").lstrip('0')
-    hour = now.strftime("%I").lstrip('0')
-    am_pm = now.strftime("%p").lower()
-    return f"ethereum-up-or-down-{month}-{day}-{hour}{am_pm}-et"
+# --- СОСТОЯНИЕ ---
+if "trades" not in st.session_state: st.session_state.trades = []
+if "eth_price" not in st.session_state: st.session_state.eth_price = 0.0
+if "liq_alert" not in st.session_state: st.session_state.liq_alert = False
 
-# --- ПОЛУЧЕНИЕ ДАННЫХ (ЖИВОЕ ОБНОВЛЕНИЕ) ---
-def get_live_data(token_id):
-    try:
-        # Добавляем случайный параметр для 100% обхода кэша
-        url = f"https://clob.polymarket.com/book?token_id={token_id}&cachebuster={random.random()}"
-        resp = requests.get(url, timeout=2).json()
-        
-        def process_side(data, is_asks=False):
-            df = pd.DataFrame(data)
-            if df.empty: return pd.DataFrame(columns=['price', 'size', 'total'])
-            df['price'] = df['price'].astype(float)
-            df['size'] = df['size'].astype(float)
-            df = df.sort_values('price', ascending=is_asks)
-            df['total'] = df['size'].cumsum()
-            return df
+# --- BINANCE WS WORKER ---
+def binance_watcher():
+    while True:
+        try:
+            ws = create_connection("wss://fstream.binance.com/ws/ethusdt@markPrice@1s/ethusdt@forceOrder")
+            while True:
+                data = json.loads(ws.recv())
+                if data['e'] == 'markPriceUpdate':
+                    st.session_state.eth_price = float(data['p'])
+                elif data['e'] == 'forceOrder':
+                    # Если ликвидация > $100k - это сигнал к агрессии
+                    vol = float(data['o']['q']) * float(data['o']['p'])
+                    if vol > 100000:
+                        st.session_state.liq_alert = True
+        except: time.sleep(5)
 
-        bids = process_side(resp.get('bids', []), False)
-        asks = process_side(resp.get('asks', []), True)
-        
-        # --- ВОЗВРАТ ЖИВОЙ ЦЕНЫ ЧЕРЕЗ MIDPOINT ---
-        live_price = 0.0
-        if not bids.empty and not asks.empty:
-            # Берем лучшие цены из стакана
-            best_bid = bids.iloc[0]['price']
-            best_ask = asks.iloc[0]['price']
-            live_price = (best_bid + best_ask) / 2
-        elif not bids.empty:
-            live_price = bids.iloc[0]['price']
-        elif not asks.empty:
-            live_price = asks.iloc[0]['price']
-            
-        return bids, asks, live_price
-    except:
-        return pd.DataFrame(), pd.DataFrame(), 0.0
+if "ws_init" not in st.session_state:
+    threading.Thread(target=binance_watcher, daemon=True).start()
+    st.session_state.ws_init = True
 
-def get_market_config(slug):
-    try:
-        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-        r = requests.get(url).json()
-        if r and len(r) > 0:
-            m = r[0]['markets'][0]
-            ids = json.loads(m['clobTokenIds'])
-            return {"title": m['question'], "yes": ids[0], "no": ids[1]}
-    except: return None
+# --- АГРЕССИВНАЯ ТОРГОВАЯ ЛОГИКА ---
+def execute_aggressive_strategy(client, tid, poly_p, size, mode):
+    results = []
+    # Агрессивная сетка: -5%, -12%, -20% (ближе к рынку для частого исполнения)
+    offsets = [0.95, 0.88, 0.80] if mode == "UP" else [1.05, 1.12, 1.20]
+    
+    for factor in offsets:
+        target_p = round(poly_p * factor, 3)
+        try:
+            order = OrderArgs(token_id=tid, price=target_p, size=size, side="BUY")
+            resp = client.post_order(client.create_order(order))
+            if resp.get("success"):
+                results.append(f"🎯 Ловушка установлена: {target_p}")
+                # Тут же планируем Тейк-Профит (в логах)
+                st.session_state.trades.append({"p": target_p, "status": "WAITING"})
+        except: pass
+    return results
 
 # --- ИНТЕРФЕЙС ---
-st.title("⚡ ETH Live Midpoint Terminal")
+st.title("🚀 AGGRESSIVE LIQUIDATION SNIPER")
 
 with st.sidebar:
+    st.header("⚙️ Настройки Бота")
     pk = st.text_input("Private Key", type="password")
-    st.info("Цена рассчитывается как Midpoint между лучшим Bid и Ask для мгновенной реакции.")
-
-# Авто-подбор рынка
-slug = get_auto_slug()
-m = get_market_config(slug)
-
-if m:
-    st.subheader(f"🎯 {m['title']}")
-    st.caption(f"Market Slug: `{slug}`")
-    
-    col_sel, col_stat = st.columns([1, 2])
-    side = col_sel.radio("Выбери ставку:", ["UP (YES)", "DOWN (NO)"], horizontal=False)
-    tid = m['yes'] if "UP" in side else m['no']
-
-    # ПОЛУЧАЕМ ЖИВОЙ СТАКАН И ЦЕНУ
-    bids, asks, live_p = get_live_data(tid)
-    
-    # Визуализация цены
-    with col_stat:
-        if live_p > 0:
-            st.metric("ЖИВАЯ ЦЕНА (MIDPOINT)", f"{live_p:.4f}", delta=f"{(live_p*100):.1f}% Chance")
-        else:
-            st.error("СТАКАН ПУСТ - ОЖИДАНИЕ ОРДЕРОВ")
-
-    # СТАКАН ЛЕСЕНКОЙ
+    aggression = st.slider("Агрессивность (частота входов)", 1, 10, 7)
+    bet_size = st.number_input("Акций за раз", value=200)
     st.divider()
-    ca, cb = st.columns(2)
-    with ca:
-        st.write("🔴 **Asks (Sell)**")
-        if not asks.empty:
-            st.dataframe(asks[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
-    with cb:
-        st.write("🟢 **Bids (Buy)**")
-        if not bids.empty:
-            st.dataframe(bids[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
+    auto_pilot = st.toggle("🤖 ВКЛЮЧИТЬ АВТОПИЛОТ", value=False)
 
-    # ТОРГОВЛЯ
-    st.divider()
-    t1, t2, t3 = st.columns([1,1,2])
-    # Предлагаем цену из Midpoint
-    val_p = float(live_p if live_p > 0 else 0.5)
-    order_p = t1.number_input("Цена", value=val_p, format="%.4f", step=0.0001)
-    order_s = t2.number_input("Кол-во", value=100)
+# Данные рынка
+tz = pytz.timezone('US/Eastern')
+now = datetime.now(tz)
+slug = f"ethereum-up-or-down-{now.strftime('%B').lower()}-{now.strftime('%d').lstrip('0')}-{now.strftime('%I').lstrip('0')}{now.strftime('%p').lower()}-et"
+
+r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}").json()
+
+if r and pk:
+    m = r[0]['markets'][0]
+    ids = json.loads(m['clobTokenIds'])
     
-    if t3.button("🚀 ОТПРАВИТЬ ОРДЕР", use_container_width=True):
-        if not pk: st.error("Введи ключ!")
-        else:
-            try:
-                client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
-                client.set_api_creds(client.create_or_derive_api_creds())
-                order = OrderArgs(token_id=tid, price=order_p, size=order_s, side="BUY")
-                res = client.post_order(client.create_order(order))
-                st.toast(f"Success: {res.get('success')}")
-            except Exception as e: st.error(e)
+    # Мониторинг стакана
+    tid_yes = ids[0]
+    book = requests.get(f"https://clob.polymarket.com/book?token_id={tid_yes}").json()
+    poly_p = float(book.get('last_price', 0.5))
+
+    # ПАНЕЛЬ СОСТОЯНИЯ
+    c1, c2, c3 = st.columns(3)
+    c1.metric("ETH PRICE", f"${st.session_state.eth_price:.2f}")
+    c2.metric("POLY UP", f"{poly_p:.4f}")
+    c3.metric("LIQ ALERT", "🔥 YES" if st.session_state.liq_alert else "🧊 NO")
+
+    # ЛОГИКА АВТОПИЛОТА
+    if auto_pilot:
+        # Если видим ликвидации ИЛИ цена ETH резко дернулась (на 0.5% за сек)
+        if st.session_state.liq_alert:
+            st.toast("🚨 ОБНАРУЖЕНА ЛИКВИДАЦИЯ! Атакую стакан...")
+            client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
+            client.set_api_creds(client.create_or_derive_api_creds())
+            
+            res = execute_aggressive_strategy(client, tid_yes, poly_p, bet_size, "UP")
+            for r_text in res: st.write(r_text)
+            
+            st.session_state.liq_alert = False # Сброс триггера
+            time.sleep(5) # Защита от спама
+
+    # ТАБЛИЦА АКТИВНОСТИ
+    st.divider()
+    st.subheader("📝 Журнал действий")
+    st.write(st.session_state.trades[::-1])
+
 else:
-    st.warning(f"Рынок `{slug}` еще не готов. Ждем открытия часа...")
+    st.warning("Бот спит. Введите ключ и дождитесь активного рынка.")
 
-# Обновление 1 сек
 time.sleep(1)
 st.rerun()
