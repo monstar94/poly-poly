@@ -1,5 +1,6 @@
 streamlit
-py-clob-client
-requests
 pandas
+requests
+py-clob-client
 pytz
+matplotlib
