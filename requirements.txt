@@ -1,6 +1,7 @@
 streamlit
-pandas
 requests
+pandas
 py-clob-client
 pytz
+pandas_ta
 websocket-client
