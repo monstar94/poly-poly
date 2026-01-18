@@ -3,119 +3,122 @@ import requests
 import json
 import pandas as pd
 import time
+import random
 from datetime import datetime
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
-st.set_page_config(page_title="Polymarket Pro Terminal", layout="wide")
+st.set_page_config(page_title="Polymarket Pro 1.0", layout="wide")
 
-# --- СТИЛИЗАЦИЯ ПОД КРИПТО-БИРЖУ ---
+# --- СТИЛИЗАЦИЯ ---
 st.markdown("""
     <style>
-    .big-price { font-size: 48px !important; font-weight: bold; color: #00ff00; text-align: center; }
-    .stTable { font-size: 12px !important; }
+    .price-container { background-color: #1e1e1e; padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; border: 1px solid #333; }
+    .main-price { font-size: 54px !important; font-weight: bold; color: #00ff00; line-height: 1; }
+    .chance-text { font-size: 24px; color: #888; margin-top: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- ГЕТТЕРЫ ДАННЫХ ---
-def get_orderbook_data(token_id):
+def get_orderbook_detailed(token_id):
     try:
-        url = f"https://clob.polymarket.com/book?token_id={token_id}&_t={int(time.time())}"
-        data = requests.get(url, timeout=2).json()
+        # Принудительный обход кэша через таймстемп
+        url = f"https://clob.polymarket.com/book?token_id={token_id}&ts={int(time.time() * 1000)}"
+        resp = requests.get(url, timeout=2).json()
         
-        def process_side(entries, reverse=False):
-            df = pd.DataFrame(entries)
+        def to_df(data, is_asks=False):
+            df = pd.DataFrame(data)
             if df.empty: return pd.DataFrame(columns=['price', 'size', 'total'])
             df['price'] = df['price'].astype(float)
             df['size'] = df['size'].astype(float)
-            df = df.sort_values('price', ascending=not reverse)
-            df['total'] = df['size'].cumsum() # Накопление объема
+            # Сортировка для лесенки: Аски по убыванию, Биды по убыванию
+            df = df.sort_values('price', ascending=not is_asks)
+            df['total'] = df['size'].cumsum()
             return df
 
-        return process_side(data.get('bids', []), True), process_side(data.get('asks', [])), data.get('last_price', 0)
+        asks = to_df(resp.get('asks', []), is_asks=True)
+        bids = to_df(resp.get('bids', []), is_asks=False)
+        
+        # Получаем актуальную цену
+        lp = resp.get('last_price')
+        if not lp or float(lp) == 0:
+            if not bids.empty and not asks.empty:
+                lp = (bids.iloc[0]['price'] + asks.iloc[0]['price']) / 2
+            elif not bids.empty: lp = bids.iloc[0]['price']
+            else: lp = 0.5 # Default if market is dead
+            
+        return bids, asks, float(lp)
     except:
-        return pd.DataFrame(), pd.DataFrame(), 0
+        return pd.DataFrame(), pd.DataFrame(), 0.5
 
-def get_active_market(url):
+def get_market_info(url):
     try:
         slug = url.strip().split('/')[-1]
-        resp = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}").json()
-        if resp:
-            m = resp[0]['markets'][0]
-            tokens = json.loads(m['clobTokenIds'])
-            return {"name": m['question'], "yes": tokens[0], "no": tokens[1]}
+        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}").json()
+        if r:
+            m = r[0]['markets'][0]
+            ids = json.loads(m['clobTokenIds'])
+            return {"title": m['question'], "yes": ids[0], "no": ids[1]}
     except: return None
 
 # --- ИНТЕРФЕЙС ---
-st.title("📊 Polymarket Depth Terminal")
+st.sidebar.header("⚙️ Настройки")
+pk = st.sidebar.text_input("Private Key", type="password")
+refresh_speed = st.sidebar.slider("Обновление (сек)", 1, 5, 1)
 
-with st.sidebar:
-    st.header("🔐 Торговый доступ")
-    pk = st.text_input("Private Key", type="password")
-    refresh = st.toggle("Live Refresh (1s)", value=True)
-    st.divider()
-    st.info("Бот автоматически рассчитывает суммарный объем (Total) для визуализации глубины стакана.")
+url_input = st.text_input("Вставь URL (Ethereum Up/Down):", "https://polymarket.com/event/ethereum-up-or-down-january-18-4am-et")
 
-link = st.text_input("URL События (Up/Down):", "https://polymarket.com/event/ethereum-up-or-down-january-18-4am-et")
-
-if link:
-    market = get_active_market(link)
-    if market:
-        st.subheader(f"🎯 {market['name']}")
+if url_input:
+    m_info = get_market_info(url_input)
+    if m_info:
+        st.subheader(f"📊 {m_info['title']}")
         
-        # Выбор стороны
-        side_col1, side_col2 = st.columns([1, 3])
-        trade_side = side_col1.radio("Торговать:", ["UP (YES)", "DOWN (NO)"], horizontal=False)
-        target_id = market['yes'] if "UP" in trade_side else market['no']
-
-        # Получение данных стакана
-        bids, asks, last_p = get_orderbook_data(target_id)
-
-        # ТЕКУЩАЯ ЦЕНА (ЦЕНТР)
-        st.markdown(f"<div class='big-price'>{float(last_p)*100:.1f}¢</div>", unsafe_allow_html=True)
+        side = st.radio("Выбери сторону:", ["UP (YES)", "DOWN (NO)"], horizontal=True)
+        tid = m_info['yes'] if "UP" in side else m_info['no']
         
-        # --- ВИЗУАЛИЗАЦИЯ СТАКАНА (Лесенка) ---
-        col_asks, col_bids = st.columns(2)
-        
-        with col_asks:
-            st.write("🔴 **Asks (Продажа / Лесенка вверх)**")
+        bids, asks, price = get_orderbook_detailed(tid)
+
+        # БЛОК ТЕКУЩЕЙ ЦЕНЫ И ШАНСА
+        chance = price * 100
+        st.markdown(f"""
+            <div class="price-container">
+                <div class="main-price">{price:.4f}</div>
+                <div class="chance-text">Текущий шанс: {chance:.1f}%</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # СТАКАН «ЛЕСЕНКОЙ»
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.write("🔴 **Продавцы (Asks)**")
             if not asks.empty:
-                # Окрашивание для визуализации накопления
-                st.dataframe(
-                    asks[['price', 'size', 'total']].sort_values('price', ascending=False).style.background_gradient(subset=['total'], cmap='Reds'),
-                    use_container_width=True, hide_index=True
-                )
-            else: st.info("Стакан пуст")
-
-        with col_bids:
-            st.write("🟢 **Bids (Покупка / Лесенка вниз)**")
+                # Самые дешевые цены внизу списка (ближе к центру)
+                st.dataframe(asks[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
+            else: st.info("Пусто")
+            
+        with col_b:
+            st.write("🟢 **Покупатели (Bids)**")
             if not bids.empty:
-                st.dataframe(
-                    bids[['price', 'size', 'total']].style.background_gradient(subset=['total'], cmap='Greens'),
-                    use_container_width=True, hide_index=True
-                )
-            else: st.info("Стакан пуст")
+                # Самые дорогие цены вверху списка (ближе к центру)
+                st.dataframe(bids[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
+            else: st.info("Пусто")
 
-        # --- ТОРГОВАЯ ПАНЕЛЬ ---
+        # ТОРГОВЛЯ
         st.divider()
-        t_col1, t_col2, t_col3 = st.columns(3)
-        # Автозаполнение цены из ближайшего ордера
-        default_p = asks['price'].min() if not asks.empty else 0.5
-        order_p = t_col1.number_input("Цена (¢)", value=float(default_p), format="%.3f")
-        order_s = t_col2.number_input("Кол-во акций", value=100, step=10)
+        c1, c2, c3 = st.columns([1,1,2])
+        trade_p = c1.number_input("Цена", value=price, format="%.4f")
+        trade_s = c2.number_input("Кол-во", value=100)
         
-        if t_col3.button("⚡ ОТПРАВИТЬ ОРДЕР", use_container_width=True):
-            if not pk: st.error("Введите ключ!")
+        if c3.button("🚀 ОТПРАВИТЬ ОРДЕР", use_container_width=True):
+            if not pk: st.error("Введи ключ!")
             else:
                 try:
                     client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
                     client.set_api_creds(client.create_or_derive_api_creds())
-                    order = OrderArgs(token_id=target_id, price=order_p, size=order_s, side="BUY")
-                    resp = client.post_order(client.create_order(order)) # Отправка в CLOB
-                    st.toast(f"Ответ API: {resp.get('success')}")
+                    order = OrderArgs(token_id=tid, price=trade_p, size=trade_s, side="BUY")
+                    res = client.post_order(client.create_order(order))
+                    st.toast(f"Результат: {res.get('success')}")
                 except Exception as e: st.error(e)
 
-# --- АВТО-ОБНОВЛЕНИЕ ---
-if refresh:
-    time.sleep(1)
-    st.rerun()
+# Авто-обновление
+time.sleep(refresh_speed)
+st.rerun()
