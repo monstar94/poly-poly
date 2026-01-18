@@ -9,119 +9,124 @@ from datetime import datetime
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
-st.set_page_config(page_title="Polymarket Auto-Terminal", layout="wide")
+st.set_page_config(page_title="ETH Live Terminal", layout="wide")
 
-# --- ЛОГИКА АВТОМАТИЧЕСКОЙ ССЫЛКИ ---
+# --- ЛОГИКА АВТО-ССЫЛКИ ---
 def get_auto_slug():
-    # Polymarket ориентируется на время в Нью-Йорке
     tz_et = pytz.timezone('US/Eastern')
     now = datetime.now(tz_et)
-    
-    # Формируем компоненты: месяц, день, час(12ч), am/pm
     month = now.strftime("%B").lower()
     day = now.strftime("%d").lstrip('0')
     hour = now.strftime("%I").lstrip('0')
     am_pm = now.strftime("%p").lower()
-    
-    # Шаблон: ethereum-up-or-down-january-17-10pm-et
     return f"ethereum-up-or-down-{month}-{day}-{hour}{am_pm}-et"
 
-# --- ПОЛУЧЕНИЕ ДАННЫХ ИЗ API ---
-def get_market_data(slug):
+# --- ПОЛУЧЕНИЕ ДАННЫХ (ЖИВОЕ ОБНОВЛЕНИЕ) ---
+def get_live_data(token_id):
     try:
-        # Запрашиваем ID токенов через Gamma API
-        url = f"https://gamma-api.polymarket.com/events?slug={slug}&_nocache={random.random()}"
-        r = requests.get(url, timeout=5).json()
-        if r and len(r) > 0:
-            m = r[0]['markets'][0]
-            ids = json.loads(m['clobTokenIds'])
-            return {"title": m['question'], "yes": ids[0], "no": ids[1], "active": m['active']}
-    except: return None
-
-def get_orderbook(token_id):
-    try:
-        # Запрос в CLOB стакан
-        url = f"https://clob.polymarket.com/book?token_id={token_id}&_cb={int(time.time())}"
+        # Добавляем случайный параметр для 100% обхода кэша
+        url = f"https://clob.polymarket.com/book?token_id={token_id}&cachebuster={random.random()}"
         resp = requests.get(url, timeout=2).json()
         
-        def process(data, is_asks=False):
+        def process_side(data, is_asks=False):
             df = pd.DataFrame(data)
             if df.empty: return pd.DataFrame(columns=['price', 'size', 'total'])
             df['price'] = df['price'].astype(float)
             df['size'] = df['size'].astype(float)
             df = df.sort_values('price', ascending=is_asks)
-            df['total'] = df['size'].cumsum() # Накопление для визуализации глубины
+            df['total'] = df['size'].cumsum()
             return df
 
-        return process(resp.get('bids', []), False), process(resp.get('asks', []), True), float(resp.get('last_price', 0))
-    except: return pd.DataFrame(), pd.DataFrame(), 0
+        bids = process_side(resp.get('bids', []), False)
+        asks = process_side(resp.get('asks', []), True)
+        
+        # --- ВОЗВРАТ ЖИВОЙ ЦЕНЫ ЧЕРЕЗ MIDPOINT ---
+        live_price = 0.0
+        if not bids.empty and not asks.empty:
+            # Берем лучшие цены из стакана
+            best_bid = bids.iloc[0]['price']
+            best_ask = asks.iloc[0]['price']
+            live_price = (best_bid + best_ask) / 2
+        elif not bids.empty:
+            live_price = bids.iloc[0]['price']
+        elif not asks.empty:
+            live_price = asks.iloc[0]['price']
+            
+        return bids, asks, live_price
+    except:
+        return pd.DataFrame(), pd.DataFrame(), 0.0
+
+def get_market_config(slug):
+    try:
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        r = requests.get(url).json()
+        if r and len(r) > 0:
+            m = r[0]['markets'][0]
+            ids = json.loads(m['clobTokenIds'])
+            return {"title": m['question'], "yes": ids[0], "no": ids[1]}
+    except: return None
 
 # --- ИНТЕРФЕЙС ---
-st.title("🤖 ETH Up/Down Auto-Terminal")
+st.title("⚡ ETH Live Midpoint Terminal")
 
 with st.sidebar:
     pk = st.text_input("Private Key", type="password")
-    st.write("---")
-    st.info("Бот сам определяет текущий час и подключается к нужному рынку.")
+    st.info("Цена рассчитывается как Midpoint между лучшим Bid и Ask для мгновенной реакции.")
 
-# 1. Генерируем слаг автоматически
-current_slug = get_auto_slug()
-current_url = f"https://polymarket.com/event/{current_slug}"
-
-st.caption(f"🔗 Активная ссылка: {current_url}")
-
-# 2. Получаем данные рынка
-m = get_market_data(current_slug)
+# Авто-подбор рынка
+slug = get_auto_slug()
+m = get_market_config(slug)
 
 if m:
     st.subheader(f"🎯 {m['title']}")
+    st.caption(f"Market Slug: `{slug}`")
     
     col_sel, col_stat = st.columns([1, 2])
-    trade_side = col_sel.radio("Выбери ставку:", ["UP (YES)", "DOWN (NO)"], horizontal=False)
-    target_id = m['yes'] if "UP" in trade_side else m['no']
+    side = col_sel.radio("Выбери ставку:", ["UP (YES)", "DOWN (NO)"], horizontal=False)
+    tid = m['yes'] if "UP" in side else m['no']
 
-    # 3. Загружаем стакан
-    bids, asks, last_price = get_orderbook(target_id)
+    # ПОЛУЧАЕМ ЖИВОЙ СТАКАН И ЦЕНУ
+    bids, asks, live_p = get_live_data(tid)
     
-    # Визуализация шанса
-    chance = last_price * 100 if last_price > 0 else 50.0
+    # Визуализация цены
     with col_stat:
-        st.metric("ТЕКУЩИЙ ШАНС (ВЕРОЯТНОСТЬ)", f"{chance:.1f}%", delta=f"{last_price:.4f}")
+        if live_p > 0:
+            st.metric("ЖИВАЯ ЦЕНА (MIDPOINT)", f"{live_p:.4f}", delta=f"{(live_p*100):.1f}% Chance")
+        else:
+            st.error("СТАКАН ПУСТ - ОЖИДАНИЕ ОРДЕРОВ")
 
-    # СТАКАН «ЛЕСЕНКОЙ»
+    # СТАКАН ЛЕСЕНКОЙ
     st.divider()
     ca, cb = st.columns(2)
     with ca:
-        st.write("🔴 **Продавцы (Asks)**")
+        st.write("🔴 **Asks (Sell)**")
         if not asks.empty:
             st.dataframe(asks[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
-        else: st.warning("Ожидание ордеров...")
     with cb:
-        st.write("🟢 **Покупатели (Bids)**")
+        st.write("🟢 **Bids (Buy)**")
         if not bids.empty:
             st.dataframe(bids[['price', 'size', 'total']].sort_values('price', ascending=False), use_container_width=True, hide_index=True)
-        else: st.warning("Ожидание ордеров...")
 
     # ТОРГОВЛЯ
     st.divider()
     t1, t2, t3 = st.columns([1,1,2])
-    order_p = t1.number_input("Цена", value=float(last_price if last_price > 0 else 0.5), format="%.4f")
-    order_s = t2.number_input("Кол-во акций", value=100)
+    # Предлагаем цену из Midpoint
+    val_p = float(live_p if live_p > 0 else 0.5)
+    order_p = t1.number_input("Цена", value=val_p, format="%.4f", step=0.0001)
+    order_s = t2.number_input("Кол-во", value=100)
     
     if t3.button("🚀 ОТПРАВИТЬ ОРДЕР", use_container_width=True):
-        if not pk: st.error("Введи Private Key!")
+        if not pk: st.error("Введи ключ!")
         else:
             try:
                 client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
                 client.set_api_creds(client.create_or_derive_api_creds())
-                order = OrderArgs(token_id=target_id, price=order_p, size=order_s, side="BUY")
+                order = OrderArgs(token_id=tid, price=order_p, size=order_s, side="BUY")
                 res = client.post_order(client.create_order(order))
-                st.toast(f"Успех: {res.get('success')}")
+                st.toast(f"Success: {res.get('success')}")
             except Exception as e: st.error(e)
-
 else:
-    st.error(f"Рынок `{current_slug}` еще не создан в API Polymarket.")
-    st.info("Обычно новые рынки появляются за несколько минут до начала часа.")
+    st.warning(f"Рынок `{slug}` еще не готов. Ждем открытия часа...")
 
 # Обновление 1 сек
 time.sleep(1)
