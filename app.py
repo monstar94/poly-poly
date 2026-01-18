@@ -1,116 +1,104 @@
 import streamlit as st
 import requests
-import time
 from datetime import datetime
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
-# --- НАСТРОЙКИ ---
+# --- КОНСТАНТЫ ---
 BUY = "BUY"
-st.set_page_config(page_title="Polymarket Debug Bot", layout="wide")
+st.set_page_config(page_title="Polymarket Manual Search Bot", layout="wide")
 
-# --- ДЕБАГ КОНСОЛЬ ---
+# --- СИСТЕМА ЛОГОВ ---
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
 def add_log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = f"[{timestamp}] {message}"
-    st.session_state.logs.append(log_entry)
-    # Ограничиваем лог последними 20 записями
-    if len(st.session_state.logs) > 20:
-        st.session_state.logs.pop(0)
+    st.session_state.logs.append(f"[{timestamp}] {message}")
+    if len(st.session_state.logs) > 15: st.session_state.logs.pop(0)
 
-# --- ФУНКЦИИ ---
-def get_active_eth_market():
-    add_log("🔍 Поиск активных 15-минутных рынков ETH...")
+# --- УЛУЧШЕННЫЙ ПОИСК ---
+def search_polymarket(query):
+    add_log(f"🔎 Ищу рынки по запросу: '{query}'...")
     try:
-        # Тэг 10051 - это Ethereum
-        url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&tag_id=10051"
+        # Используем эндпоинт поиска Gamma API
+        url = f"https://gamma-api.polymarket.com/public-search?q={query}"
         resp = requests.get(url).json()
         
-        markets = []
-        for m in resp:
-            title = m.get('question', '').lower()
-            # Фильтруем именно краткосрочные рынки цены
-            if "ethereum" in title and ("above" in title or "price" in title):
-                tokens = m.get('tokens')
-                if tokens:
-                    markets.append({
-                        "id": tokens[0]['token_id'],
-                        "name": m['question']
-                    })
-        
-        if markets:
-            add_log(f"✅ Найдено рынков: {len(markets)}")
-            return markets[0]['id'], markets[0]['name']
+        results = []
+        # API возвращает события (events), в каждом из которых есть рынки (markets)
+        if "events" in resp:
+            for event in resp["events"]:
+                for market in event.get("markets", []):
+                    # Берем только активные рынки
+                    if market.get("active") and not market.get("closed"):
+                        tokens = market.get("clobTokenIds")
+                        if tokens:
+                            # Парсим ID токена (обычно первый - это YES)
+                            import json
+                            token_list = json.loads(tokens)
+                            results.append({
+                                "name": market["question"],
+                                "id": token_list[0],
+                                "ends": market.get("endDate")
+                            })
+        return results
     except Exception as e:
-        add_log(f"❌ Ошибка поиска рынка: {str(e)}")
-    return None, None
+        add_log(f"❌ Ошибка поиска: {e}")
+        return []
 
 # --- ИНТЕРФЕЙС ---
-st.title("🛡️ Polymarket Impulse Bot + Debug")
+st.title("🎛️ Polymarket: Ручной поиск и Торговля")
 
-col_main, col_debug = st.columns([2, 1])
+col_left, col_right = st.columns([2, 1])
 
-with col_main:
-    st.subheader("Настройки и Управление")
+with col_left:
+    pk = st.text_input("1. Введите Private Key (0x...)", type="password")
+    search_query = st.text_input("2. Что ищем? (например: ethereum или btc)", value="ethereum")
     
-    private_key = st.text_input("Введите Private Key (0x...)", type="password", help="Ваш закрытый ключ от кошелька")
-    
-    if private_key:
-        try:
-            # 1. Инициализация (L1 Auth)
-            add_log("⚙️ Инициализация клиента...")
-            client = ClobClient("https://clob.polymarket.com", key=private_key, chain_id=137)
-            
-            # 2. Создание API ключей (L2 Auth)
-            # Это обязательный шаг для торговли, даже если они уже были созданы
-            add_log("🔑 Генерация сессионных ключей (L2 Auth)...")
-            api_creds = client.create_or_derive_api_creds()
-            client.set_api_creds(api_creds)
-            add_log("🔓 Авторизация успешна.")
+    if st.button("Найти рынки"):
+        st.session_state.found_markets = search_polymarket(search_query)
 
-            # Поиск рынка
-            token_id, market_name = get_active_eth_market()
-            
-            if token_id:
-                st.info(f"**Рынок:** {market_name}\n\n**Token ID:** `{token_id}`")
-                
-                c1, c2, c3 = st.columns(3)
-                price = c1.number_input("Цена акции (0.01 - 0.99)", value=0.05)
-                amount = c2.number_input("Кол-во акций", value=10)
-                
-                if st.button("🚀 ВЫСТАВИТЬ ОРДЕР", use_container_width=True):
-                    add_log(f"📡 Отправка ордера: {amount} шт по {price} USDC...")
-                    order_args = OrderArgs(token_id=token_id, price=price, size=amount, side=BUY)
-                    signed_order = client.create_order(order_args)
-                    resp = client.post_order(signed_order)
+    if "found_markets" in st.session_state and st.session_state.found_markets:
+        st.write(f"Найдено активных рынков: {len(st.session_state.found_markets)}")
+        
+        # Выбор рынка из списка найденных
+        market_options = {m['name']: m['id'] for m in st.session_state.found_markets}
+        selected_market_name = st.selectbox("3. Выберите конкретный рынок:", list(market_options.keys()))
+        selected_token_id = market_options[selected_market_name]
+        
+        st.code(f"Выбран Token ID: {selected_token_id}")
+
+        # Настройки ордера
+        c1, c2 = st.columns(2)
+        price = c1.number_input("Цена (от 0.01 до 0.99)", value=0.05, step=0.01)
+        amount = c2.number_input("Кол-во акций", value=10, step=1)
+
+        if st.button("🚀 ВЫСТАВИТЬ ЛИМИТКУ"):
+            if not pk:
+                st.error("Сначала введите Private Key!")
+            else:
+                try:
+                    add_log("⚙️ Авторизация...")
+                    client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
+                    client.set_api_creds(client.create_or_derive_api_creds())
+                    
+                    add_log(f"📡 Отправка ордера на {selected_token_id}...")
+                    order = OrderArgs(token_id=selected_token_id, price=price, size=amount, side=BUY)
+                    resp = client.post_order(client.create_order(order))
                     
                     if resp.get("success"):
-                        add_log("🎯 ОРДЕР ВЫСТАВЛЕН УСПЕШНО!")
+                        add_log("🎯 УСПЕХ: Ордер в стакане!")
                         st.balloons()
                     else:
-                        add_log(f"⚠️ Ошибка биржи: {resp.get('error')}")
+                        add_log(f"⚠️ Ошибка: {resp.get('error')}")
                     st.json(resp)
-            else:
-                st.warning("Активные рынки не найдены. Попробуйте обновить страницу через минуту.")
-                if st.button("🔄 Обновить поиск"):
-                    st.rerun()
+                except Exception as e:
+                    add_log(f"⛔ Ошибка: {e}")
+    elif "found_markets" in st.session_state:
+        st.warning("Ничего не найдено. Попробуйте другое слово.")
 
-        except Exception as e:
-            add_log(f"⛔ Критическая ошибка: {str(e)}")
-            st.error(f"Проверьте правильность Private Key. Ошибка: {e}")
-    else:
-        st.info("Ожидание ввода Private Key...")
-
-# --- КОНСОЛЬ ОТЛАДКИ ---
-with col_debug:
-    st.subheader("📟 Debug Console")
-    console_box = st.empty()
-    log_text = "\n".join(st.session_state.logs[::-1]) # Показываем новые сверху
-    console_box.code(log_text if log_text else "Консоль пуста...")
-    
-    if st.button("Очистить логи"):
-        st.session_state.logs = []
-        st.rerun()
+with col_right:
+    st.subheader("📟 Консоль")
+    log_area = st.empty()
+    log_area.code("\n".join(st.session_state.logs[::-1]))
