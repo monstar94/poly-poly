@@ -3,4 +3,4 @@ pandas
 requests
 py-clob-client
 pytz
-matplotlib
+websocket-client
